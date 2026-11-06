@@ -1,9 +1,9 @@
 [package]
 name = "unix-wasm-sandbox"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 license = "Apache-2.0"
-rust-version = "1.91"
+rust-version = "1.95"
 description = "A PyO3-powered Python API for running UNIX-like Wasmer sandboxes."
 
 [lib]
@@ -22,16 +22,12 @@ serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.138"
 thiserror = "2.0.11"
 tokio = { version = "1.43.0", features = ["io-util", "rt-multi-thread", "sync", "time"] }
-virtual-fs = "0.701.0"
-wasmer = { version = "7.1.0", features = ["llvm"] }
-wasmer-package = "0.701.0"
-wasmer-wasix = "0.701.0"
+virtual-fs = { git = "https://github.com/EulerMacaroni/wasmer", rev = "b6f47fc68d6f2c95ad47569be822ab2d8a0beca4" }
+wasmer = { git = "https://github.com/EulerMacaroni/wasmer", rev = "b6f47fc68d6f2c95ad47569be822ab2d8a0beca4", features = ["llvm"] }
+wasmer-package = { git = "https://github.com/EulerMacaroni/wasmer", rev = "b6f47fc68d6f2c95ad47569be822ab2d8a0beca4" }
+wasmer-wasix = { git = "https://github.com/EulerMacaroni/wasmer", rev = "b6f47fc68d6f2c95ad47569be822ab2d8a0beca4" }
 wat = "1.240.0"
-webc = "11.0.0"
+webc = "=12.0.1"
 
 [dev-dependencies]
 tempfile = "3.15.0"
-
-[patch.crates-io]
-wasmer-compiler-llvm = { path = "vendor/wasmer-compiler-llvm" }
-wasmer-wasix = { path = "vendor/wasmer-wasix" }

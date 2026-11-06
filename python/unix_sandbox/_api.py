@@ -868,7 +868,7 @@ class Limits:
 def _resolve_process_limits(
     default_limits: Limits,
     limits: Limits | None,
-    wall_time_seconds: float | None | _WallTimeSecondsUnset,
+    wall_time_seconds: float | _WallTimeSecondsUnset | None,
 ) -> Limits:
     """:param default_limits: Sandbox-level process limits.
     :param limits: Complete per-process limit override.

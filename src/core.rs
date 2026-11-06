@@ -18,9 +18,9 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncWrite, AsyncWriteExt, ReadBuf};
 use virtual_fs::{
-    create_dir_all, host_fs, DirEntry, FileOpener, FileSystem, FileType, FsError, Metadata,
-    NullFile, OpenOptionsConfig, OverlayFileSystem, ReadDir, StaticFile, TmpFileSystem,
-    UnionFileSystem, UnionMergeMode, VirtualFile,
+    create_dir_all, host_fs, mem_fs::FileSystem as MemoryFileSystem, DirEntry, FileOpener,
+    FileSystem, FileType, FsError, Metadata, MountFileSystem, NullFile, OpenOptionsConfig,
+    OverlayFileSystem, ReadDir, StaticFile, VirtualFile,
 };
 use wasmer::sys::{BaseTunables, EngineBuilder, Features, NativeEngineExt, LLVM};
 use wasmer_package::utils::from_bytes;
@@ -261,7 +261,7 @@ pub struct CancellationToken {
 
 #[derive(Clone)]
 pub struct SandboxState {
-    pub fs: TmpFileSystem,
+    pub fs: MemoryFileSystem,
     pub cwd: String,
     pub env: HashMap<String, String>,
     pub catalog: Arc<PackageCatalog>,
@@ -476,9 +476,6 @@ struct VirtualExecutableBridgeFile {
     response: Option<Vec<u8>>,
     cursor: usize,
 }
-
-#[derive(Debug)]
-struct RelativeOrAbsolutePathHack<F>(F);
 
 impl FileSystemEventKind {
     pub fn as_str(self) -> &'static str {
@@ -709,7 +706,7 @@ impl VirtualExecutableRegistry {
 
     pub fn register(
         &self,
-        fs: &TmpFileSystem,
+        fs: &MemoryFileSystem,
         token: u64,
         paths: Vec<String>,
         replace: bool,
@@ -767,7 +764,7 @@ impl VirtualExecutableRegistry {
         Ok(())
     }
 
-    pub fn unregister(&self, fs: &TmpFileSystem, token: u64) -> Result<()> {
+    pub fn unregister(&self, fs: &MemoryFileSystem, token: u64) -> Result<()> {
         let mut inner = self
             .inner
             .lock()
@@ -980,15 +977,6 @@ impl FileSystem for ReadOnlyFileSystem {
     fn new_open_options(&self) -> virtual_fs::OpenOptions<'_> {
         virtual_fs::OpenOptions::new(self)
     }
-
-    fn mount(
-        &self,
-        _name: String,
-        _path: &Path,
-        _fs: Box<dyn FileSystem + Send + Sync>,
-    ) -> virtual_fs::Result<()> {
-        Err(FsError::PermissionDenied)
-    }
 }
 
 impl FileOpener for ReadOnlyFileSystem {
@@ -1179,15 +1167,6 @@ impl FileSystem for ObservableFileSystem {
 
     fn new_open_options(&self) -> virtual_fs::OpenOptions<'_> {
         virtual_fs::OpenOptions::new(self)
-    }
-
-    fn mount(
-        &self,
-        name: String,
-        path: &Path,
-        fs: Box<dyn FileSystem + Send + Sync>,
-    ) -> virtual_fs::Result<()> {
-        self.inner.mount(name, path, fs)
     }
 }
 
@@ -1412,15 +1391,6 @@ impl FileSystem for VirtualExecutableFileSystem {
     fn new_open_options(&self) -> virtual_fs::OpenOptions<'_> {
         virtual_fs::OpenOptions::new(self)
     }
-
-    fn mount(
-        &self,
-        name: String,
-        path: &Path,
-        fs: Box<dyn FileSystem + Send + Sync>,
-    ) -> virtual_fs::Result<()> {
-        self.inner.mount(name, path, fs)
-    }
 }
 
 impl FileOpener for VirtualExecutableFileSystem {
@@ -1570,87 +1540,6 @@ impl VirtualFile for VirtualExecutableBridgeFile {
     }
 }
 
-impl<F: FileSystem> RelativeOrAbsolutePathHack<F> {
-    fn execute<Func, Ret>(&self, path: &Path, operation: Func) -> virtual_fs::Result<Ret>
-    where
-        Func: Fn(&F, &Path) -> virtual_fs::Result<Ret>,
-    {
-        let result = operation(&self.0, path);
-        if result.is_err() && !path.is_absolute() {
-            return operation(&self.0, &Path::new("/").join(path));
-        }
-        result
-    }
-}
-
-impl<F: FileSystem> FileSystem for RelativeOrAbsolutePathHack<F> {
-    fn readlink(&self, path: &Path) -> virtual_fs::Result<PathBuf> {
-        self.execute(path, |fs, candidate| fs.readlink(candidate))
-    }
-
-    fn read_dir(&self, path: &Path) -> virtual_fs::Result<virtual_fs::ReadDir> {
-        self.execute(path, |fs, candidate| fs.read_dir(candidate))
-    }
-
-    fn create_dir(&self, path: &Path) -> virtual_fs::Result<()> {
-        self.execute(path, |fs, candidate| fs.create_dir(candidate))
-    }
-
-    fn remove_dir(&self, path: &Path) -> virtual_fs::Result<()> {
-        self.execute(path, |fs, candidate| fs.remove_dir(candidate))
-    }
-
-    fn rename<'a>(
-        &'a self,
-        from: &'a Path,
-        to: &'a Path,
-    ) -> Pin<Box<dyn Future<Output = virtual_fs::Result<()>> + Send + 'a>> {
-        Box::pin(async move { self.0.rename(from, to).await })
-    }
-
-    fn metadata(&self, path: &Path) -> virtual_fs::Result<virtual_fs::Metadata> {
-        self.execute(path, |fs, candidate| fs.metadata(candidate))
-    }
-
-    fn symlink_metadata(&self, path: &Path) -> virtual_fs::Result<virtual_fs::Metadata> {
-        self.execute(path, |fs, candidate| fs.symlink_metadata(candidate))
-    }
-
-    fn remove_file(&self, path: &Path) -> virtual_fs::Result<()> {
-        self.execute(path, |fs, candidate| fs.remove_file(candidate))
-    }
-
-    fn new_open_options(&self) -> virtual_fs::OpenOptions<'_> {
-        virtual_fs::OpenOptions::new(self)
-    }
-
-    fn mount(
-        &self,
-        name: String,
-        path: &Path,
-        fs: Box<dyn FileSystem + Send + Sync>,
-    ) -> virtual_fs::Result<()> {
-        let fs = Arc::new(fs);
-        self.execute(path, move |inner, candidate| {
-            inner.mount(name.clone(), candidate, Box::new(Arc::clone(&fs)))
-        })
-    }
-}
-
-impl<F: FileSystem> FileOpener for RelativeOrAbsolutePathHack<F> {
-    fn open(
-        &self,
-        path: &Path,
-        config: &OpenOptionsConfig,
-    ) -> virtual_fs::Result<Box<dyn VirtualFile + Send + Sync + 'static>> {
-        self.execute(path, |fs, candidate| {
-            fs.new_open_options()
-                .options(config.clone())
-                .open(candidate)
-        })
-    }
-}
-
 impl SandboxState {
     pub fn new(
         files: HashMap<String, Option<Vec<u8>>>,
@@ -1662,7 +1551,7 @@ impl SandboxState {
         virtual_processes: VirtualExecutableBridge,
     ) -> Result<Self> {
         let catalog = catalog_for(packages)?;
-        let fs = TmpFileSystem::new();
+        let fs = MemoryFileSystem::default();
         create_default_layout(&catalog, &fs)?;
         let cwd = normalize_path(&cwd)?;
         let cwd = cwd
@@ -2119,7 +2008,7 @@ impl PackageCatalog {
         command_name: &str,
         package: &BinaryPackage,
         injected_packages: Vec<BinaryPackage>,
-        root_fs: TmpFileSystem,
+        root_fs: MemoryFileSystem,
         events: EventBus,
         virtual_executables: VirtualExecutableRegistry,
         wall_time: Option<Duration>,
@@ -2238,35 +2127,32 @@ impl PackageCatalog {
 fn process_package_files(
     package: &BinaryPackage,
     injected_packages: &[BinaryPackage],
-) -> Result<Option<UnionFileSystem>> {
-    let mut package_files = package.webc_fs.as_deref().map(UnionFileSystem::duplicate);
-    for injected_package in injected_packages {
-        let Some(injected_files) = injected_package.webc_fs.as_deref() else {
+) -> Result<MountFileSystem> {
+    let files = MountFileSystem::new();
+    // The command's package owns conflicting mounts; injected packages fill the rest.
+    for package in std::iter::once(package).chain(injected_packages) {
+        let Some(mounts) = &package.package_mounts else {
             continue;
         };
-        match &mut package_files {
-            Some(files) => files.merge(injected_files, UnionMergeMode::Skip)?,
-            None => package_files = Some(injected_files.duplicate()),
+        for entry in mounts.to_mount_fs()?.mount_entries() {
+            if files.filesystem_at(&entry.path).is_some() {
+                continue;
+            }
+            files.mount_with_source(entry.path, entry.source_path, entry.fs)?;
         }
     }
-    Ok(package_files)
+    Ok(files)
 }
 
 fn process_filesystem(
-    root_fs: TmpFileSystem,
-    package_files: Option<UnionFileSystem>,
+    root_fs: MemoryFileSystem,
+    package_files: MountFileSystem,
     events: EventBus,
     virtual_executables: VirtualExecutableRegistry,
     wall_time: Option<Duration>,
     cancellation: CancellationToken,
 ) -> Arc<dyn FileSystem + Send + Sync> {
-    let filesystem: Arc<dyn FileSystem + Send + Sync> = match package_files {
-        Some(files) => {
-            let overlay = OverlayFileSystem::new(root_fs, [RelativeOrAbsolutePathHack(files)]);
-            Arc::new(overlay)
-        }
-        None => Arc::new(root_fs),
-    };
+    let filesystem = Arc::new(OverlayFileSystem::new(root_fs, [package_files]));
     let filesystem = Arc::new(VirtualExecutableFileSystem::new(
         filesystem,
         virtual_executables,
@@ -2884,7 +2770,7 @@ fn duration_from_seconds(seconds: f64) -> Result<Duration> {
     Ok(Duration::from_secs_f64(seconds))
 }
 
-fn create_default_layout(catalog: &PackageCatalog, fs: &TmpFileSystem) -> Result<()> {
+fn create_default_layout(catalog: &PackageCatalog, fs: &MemoryFileSystem) -> Result<()> {
     for path in [
         "/bin",
         "/usr",
@@ -3033,7 +2919,7 @@ fn current_time_nanos() -> u64 {
         .unwrap_or(0)
 }
 
-fn write_file_to_fs_blocking(fs: &TmpFileSystem, path: &Path, data: Vec<u8>) -> Result<()> {
+fn write_file_to_fs_blocking(fs: &MemoryFileSystem, path: &Path, data: Vec<u8>) -> Result<()> {
     create_parent_directories(fs, path)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -3061,7 +2947,7 @@ fn command_path_from_path_entry(directory: &str, command: &str, cwd: &Path) -> R
     normalize_command_path(command_path, cwd)
 }
 
-fn validate_directory(fs: &TmpFileSystem, path: &Path, name: &str) -> Result<()> {
+fn validate_directory(fs: &MemoryFileSystem, path: &Path, name: &str) -> Result<()> {
     let metadata = match fs.metadata(path) {
         Ok(metadata) => metadata,
         Err(FsError::EntryNotFound) => {
@@ -3112,7 +2998,7 @@ fn validate_host_mount_source(path: &str) -> Result<PathBuf> {
         .with_context(|| format!("unable to resolve host mount source {}", path.display()))
 }
 
-fn create_parent_directories(fs: &TmpFileSystem, path: &Path) -> Result<()> {
+fn create_parent_directories(fs: &MemoryFileSystem, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         create_dir_all(fs, parent)
             .with_context(|| format!("unable to create {}", parent.display()))?;
@@ -3120,7 +3006,7 @@ fn create_parent_directories(fs: &TmpFileSystem, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn create_directories(fs: &TmpFileSystem, path: &Path) -> Result<Vec<PathBuf>> {
+fn create_directories(fs: &MemoryFileSystem, path: &Path) -> Result<Vec<PathBuf>> {
     let mut current = PathBuf::from("/");
     let mut created_paths = Vec::new();
     for component in path.components() {
@@ -3146,14 +3032,14 @@ fn create_directories(fs: &TmpFileSystem, path: &Path) -> Result<Vec<PathBuf>> {
     Ok(created_paths)
 }
 
-async fn read_file_from_fs(fs: &TmpFileSystem, path: &Path) -> Result<Vec<u8>> {
+async fn read_file_from_fs(fs: &MemoryFileSystem, path: &Path) -> Result<Vec<u8>> {
     let mut file = fs.new_open_options().read(true).open(path)?;
     let mut contents = Vec::new();
     file.read_to_end(&mut contents).await?;
     Ok(contents)
 }
 
-async fn write_file_to_fs(fs: &TmpFileSystem, path: &Path, data: Vec<u8>) -> Result<()> {
+async fn write_file_to_fs(fs: &MemoryFileSystem, path: &Path, data: Vec<u8>) -> Result<()> {
     let mut file = fs
         .new_open_options()
         .create(true)
