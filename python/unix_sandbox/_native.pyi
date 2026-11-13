@@ -7,6 +7,26 @@ class CompletedProcess:
     stderr: bytes
 
 
+class StartedProcess:
+    args: list[str]
+    returncode: int | None
+    stdin_closed: bool
+    stdout: bytes
+    stderr: bytes
+
+    def is_running(self) -> bool: ...
+
+    def write_stdin(self, data: bytes) -> None: ...
+
+    def close_stdin(self) -> None: ...
+
+    def cancel(self) -> None: ...
+
+    def wait(self) -> Awaitable[CompletedProcess]: ...
+
+    def wait_blocking(self) -> CompletedProcess: ...
+
+
 class Sandbox:
     def __init__(
         self,
@@ -15,8 +35,6 @@ class Sandbox:
         packages: list[tuple[str, str, str, list[tuple[str, str]]]],
         cwd: str,
         env: dict[str, str],
-        output_limit: int,
-        wall_time_seconds: float | None,
         event_queue_size: int,
     ) -> None: ...
 
@@ -45,6 +63,16 @@ class Sandbox:
 
     def cancel_process(self, id: int) -> None: ...
 
+    def start(
+        self,
+        id: int,
+        args: list[str],
+        env: dict[str, str] | None,
+        cwd: str | None,
+        output_limit: int,
+        wall_time_seconds: float | None,
+    ) -> StartedProcess: ...
+
     def exists(self, path: str) -> Awaitable[bool]: ...
 
     def read_file(self, path: str) -> Awaitable[bytes]: ...
@@ -60,4 +88,6 @@ class Sandbox:
         input: bytes | None,
         env: dict[str, str] | None,
         cwd: str | None,
+        output_limit: int,
+        wall_time_seconds: float | None,
     ) -> Awaitable[CompletedProcess]: ...

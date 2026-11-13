@@ -4,10 +4,10 @@ build-backend = "maturin"
 
 [project]
 name = "unix-wasm-sandbox"
-version = "0.3.0"
+version = "0.4.1"
 description = "A safe Python API for running UNIX-like Wasmer sandboxes."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.9"
 license = "Apache-2.0"
 authors = [
     { name = "Tanmay Bakshi" },
@@ -40,21 +40,21 @@ features = ["extension-module"]
 include = [
     { path = "python/unix_sandbox/assets/*.webc.gz", format = "wheel" },
     { path = "python/unix_sandbox/assets/*.json", format = "wheel" },
-    { path = "vendor/wasmer-compiler-llvm/**/*", format = "sdist" },
 ]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py39"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.10"
 strict = true
 packages = ["unix_sandbox"]

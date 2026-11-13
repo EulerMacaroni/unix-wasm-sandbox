@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     env,
     future::Future,
     io::{self, SeekFrom},
@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, Mutex,
     },
-    task::{Context as TaskContext, Poll},
+    task::{Context as TaskContext, Poll, Waker},
     time::{Duration, Instant},
 };
 
@@ -18,14 +18,15 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncWrite, AsyncWriteExt, ReadBuf};
 use virtual_fs::{
-    create_dir_all, host_fs, DirEntry, FileOpener, FileSystem, FileType, FsError, Metadata,
-    NullFile, OpenOptionsConfig, OverlayFileSystem, ReadDir, StaticFile, TmpFileSystem,
-    UnionFileSystem, UnionMergeMode, VirtualFile,
+    create_dir_all, host_fs, mem_fs::FileSystem as MemoryFileSystem, DirEntry, FileOpener,
+    FileSystem, FileType, FsError, Metadata, MountFileSystem, NullFile, OpenOptionsConfig,
+    OverlayFileSystem, ReadDir, StaticFile, VirtualFile,
 };
 use wasmer::sys::{BaseTunables, EngineBuilder, Features, NativeEngineExt, LLVM};
 use wasmer_package::utils::from_bytes;
 use wasmer_wasix::{
     bin_factory::{spawn_exec, BinaryPackage},
+    os::{TtyBridge, WasiTtyState},
     runtime::{
         module_cache::{FileSystemCache, ModuleCache, SharedCache},
         package_loader::BuiltinPackageLoader,
@@ -260,10 +261,9 @@ pub struct CancellationToken {
 
 #[derive(Clone)]
 pub struct SandboxState {
-    pub fs: TmpFileSystem,
+    pub fs: MemoryFileSystem,
     pub cwd: String,
     pub env: HashMap<String, String>,
-    pub limits: Limits,
     pub catalog: Arc<PackageCatalog>,
     pub events: EventBus,
     pub virtual_executables: VirtualExecutableRegistry,
@@ -359,11 +359,38 @@ pub struct PackageCatalog {
     command_paths: HashMap<PathBuf, CommandTarget>,
 }
 
+#[derive(Debug)]
+struct NonInteractiveTty;
+
+impl TtyBridge for NonInteractiveTty {
+    fn reset(&self) {}
+
+    fn tty_get(&self) -> WasiTtyState {
+        WasiTtyState {
+            stdin_tty: false,
+            stdout_tty: false,
+            stderr_tty: false,
+            echo: false,
+            line_buffered: false,
+            ..WasiTtyState::default()
+        }
+    }
+
+    fn tty_set(&self, _tty_state: WasiTtyState) {}
+}
+
 pub struct RunRequest {
     pub args: Vec<String>,
     pub input: Option<Vec<u8>>,
     pub env: Option<HashMap<String, String>>,
     pub cwd: Option<String>,
+    pub limits: Limits,
+}
+
+pub(crate) struct ProcessStreams {
+    pub stdin: Box<dyn VirtualFile + Send + Sync + 'static>,
+    pub stdout: CapturedOutput,
+    pub stderr: CapturedOutput,
 }
 
 struct ProcessIo {
@@ -449,9 +476,6 @@ struct VirtualExecutableBridgeFile {
     response: Option<Vec<u8>>,
     cursor: usize,
 }
-
-#[derive(Debug)]
-struct RelativeOrAbsolutePathHack<F>(F);
 
 impl FileSystemEventKind {
     pub fn as_str(self) -> &'static str {
@@ -682,7 +706,7 @@ impl VirtualExecutableRegistry {
 
     pub fn register(
         &self,
-        fs: &TmpFileSystem,
+        fs: &MemoryFileSystem,
         token: u64,
         paths: Vec<String>,
         replace: bool,
@@ -740,7 +764,7 @@ impl VirtualExecutableRegistry {
         Ok(())
     }
 
-    pub fn unregister(&self, fs: &TmpFileSystem, token: u64) -> Result<()> {
+    pub fn unregister(&self, fs: &MemoryFileSystem, token: u64) -> Result<()> {
         let mut inner = self
             .inner
             .lock()
@@ -953,15 +977,6 @@ impl FileSystem for ReadOnlyFileSystem {
     fn new_open_options(&self) -> virtual_fs::OpenOptions<'_> {
         virtual_fs::OpenOptions::new(self)
     }
-
-    fn mount(
-        &self,
-        _name: String,
-        _path: &Path,
-        _fs: Box<dyn FileSystem + Send + Sync>,
-    ) -> virtual_fs::Result<()> {
-        Err(FsError::PermissionDenied)
-    }
 }
 
 impl FileOpener for ReadOnlyFileSystem {
@@ -1152,15 +1167,6 @@ impl FileSystem for ObservableFileSystem {
 
     fn new_open_options(&self) -> virtual_fs::OpenOptions<'_> {
         virtual_fs::OpenOptions::new(self)
-    }
-
-    fn mount(
-        &self,
-        name: String,
-        path: &Path,
-        fs: Box<dyn FileSystem + Send + Sync>,
-    ) -> virtual_fs::Result<()> {
-        self.inner.mount(name, path, fs)
     }
 }
 
@@ -1385,15 +1391,6 @@ impl FileSystem for VirtualExecutableFileSystem {
     fn new_open_options(&self) -> virtual_fs::OpenOptions<'_> {
         virtual_fs::OpenOptions::new(self)
     }
-
-    fn mount(
-        &self,
-        name: String,
-        path: &Path,
-        fs: Box<dyn FileSystem + Send + Sync>,
-    ) -> virtual_fs::Result<()> {
-        self.inner.mount(name, path, fs)
-    }
 }
 
 impl FileOpener for VirtualExecutableFileSystem {
@@ -1543,87 +1540,6 @@ impl VirtualFile for VirtualExecutableBridgeFile {
     }
 }
 
-impl<F: FileSystem> RelativeOrAbsolutePathHack<F> {
-    fn execute<Func, Ret>(&self, path: &Path, operation: Func) -> virtual_fs::Result<Ret>
-    where
-        Func: Fn(&F, &Path) -> virtual_fs::Result<Ret>,
-    {
-        let result = operation(&self.0, path);
-        if result.is_err() && !path.is_absolute() {
-            return operation(&self.0, &Path::new("/").join(path));
-        }
-        result
-    }
-}
-
-impl<F: FileSystem> FileSystem for RelativeOrAbsolutePathHack<F> {
-    fn readlink(&self, path: &Path) -> virtual_fs::Result<PathBuf> {
-        self.execute(path, |fs, candidate| fs.readlink(candidate))
-    }
-
-    fn read_dir(&self, path: &Path) -> virtual_fs::Result<virtual_fs::ReadDir> {
-        self.execute(path, |fs, candidate| fs.read_dir(candidate))
-    }
-
-    fn create_dir(&self, path: &Path) -> virtual_fs::Result<()> {
-        self.execute(path, |fs, candidate| fs.create_dir(candidate))
-    }
-
-    fn remove_dir(&self, path: &Path) -> virtual_fs::Result<()> {
-        self.execute(path, |fs, candidate| fs.remove_dir(candidate))
-    }
-
-    fn rename<'a>(
-        &'a self,
-        from: &'a Path,
-        to: &'a Path,
-    ) -> Pin<Box<dyn Future<Output = virtual_fs::Result<()>> + Send + 'a>> {
-        Box::pin(async move { self.0.rename(from, to).await })
-    }
-
-    fn metadata(&self, path: &Path) -> virtual_fs::Result<virtual_fs::Metadata> {
-        self.execute(path, |fs, candidate| fs.metadata(candidate))
-    }
-
-    fn symlink_metadata(&self, path: &Path) -> virtual_fs::Result<virtual_fs::Metadata> {
-        self.execute(path, |fs, candidate| fs.symlink_metadata(candidate))
-    }
-
-    fn remove_file(&self, path: &Path) -> virtual_fs::Result<()> {
-        self.execute(path, |fs, candidate| fs.remove_file(candidate))
-    }
-
-    fn new_open_options(&self) -> virtual_fs::OpenOptions<'_> {
-        virtual_fs::OpenOptions::new(self)
-    }
-
-    fn mount(
-        &self,
-        name: String,
-        path: &Path,
-        fs: Box<dyn FileSystem + Send + Sync>,
-    ) -> virtual_fs::Result<()> {
-        let fs = Arc::new(fs);
-        self.execute(path, move |inner, candidate| {
-            inner.mount(name.clone(), candidate, Box::new(Arc::clone(&fs)))
-        })
-    }
-}
-
-impl<F: FileSystem> FileOpener for RelativeOrAbsolutePathHack<F> {
-    fn open(
-        &self,
-        path: &Path,
-        config: &OpenOptionsConfig,
-    ) -> virtual_fs::Result<Box<dyn VirtualFile + Send + Sync + 'static>> {
-        self.execute(path, |fs, candidate| {
-            fs.new_open_options()
-                .options(config.clone())
-                .open(candidate)
-        })
-    }
-}
-
 impl SandboxState {
     pub fn new(
         files: HashMap<String, Option<Vec<u8>>>,
@@ -1631,12 +1547,11 @@ impl SandboxState {
         packages: Vec<PackageSpec>,
         cwd: String,
         env: HashMap<String, String>,
-        limits: Limits,
         events: EventBus,
         virtual_processes: VirtualExecutableBridge,
     ) -> Result<Self> {
         let catalog = catalog_for(packages)?;
-        let fs = TmpFileSystem::new();
+        let fs = MemoryFileSystem::default();
         create_default_layout(&catalog, &fs)?;
         let cwd = normalize_path(&cwd)?;
         let cwd = cwd
@@ -1650,7 +1565,6 @@ impl SandboxState {
             fs,
             cwd,
             env: sandbox_env,
-            limits,
             catalog,
             events,
             virtual_executables: VirtualExecutableRegistry::new(virtual_processes),
@@ -1799,6 +1713,16 @@ impl SandboxState {
     ) -> Result<CompletedProcess> {
         self.catalog.run(self, request, cancellation)
     }
+
+    pub(crate) fn run_with_stdio_blocking(
+        &self,
+        request: RunRequest,
+        streams: ProcessStreams,
+        cancellation: CancellationToken,
+    ) -> Result<CompletedProcess> {
+        self.catalog
+            .run_with_stdio(self, request, streams, cancellation)
+    }
 }
 
 impl PackageCatalog {
@@ -1814,6 +1738,7 @@ impl PackageCatalog {
         let _runtime_guard = handle.enter();
         let mut runtime = PluggableRuntime::new(virtual_task_manager);
         runtime.set_engine(sandbox_engine());
+        runtime.set_tty(Arc::new(NonInteractiveTty));
         runtime.set_module_cache(SharedCache::default().with_fallback(FileSystemCache::new(
             module_cache_dir(),
             Arc::clone(&task_manager),
@@ -1857,12 +1782,41 @@ impl PackageCatalog {
         request: RunRequest,
         cancellation: CancellationToken,
     ) -> Result<CompletedProcess> {
+        let RunRequest {
+            args,
+            input,
+            env,
+            cwd,
+            limits,
+        } = request;
+        let input = input.unwrap_or_default();
+        let streams = ProcessStreams {
+            stdin: Box::new(StaticFile::new(input)),
+            stdout: CapturedOutput::new(limits.output_bytes),
+            stderr: CapturedOutput::new(limits.output_bytes),
+        };
+        let request = RunRequest {
+            args,
+            input: None,
+            env,
+            cwd,
+            limits,
+        };
+        self.run_with_stdio(state, request, streams, cancellation)
+    }
+
+    fn run_with_stdio(
+        &self,
+        state: &SandboxState,
+        request: RunRequest,
+        streams: ProcessStreams,
+        cancellation: CancellationToken,
+    ) -> Result<CompletedProcess> {
         if request.args.is_empty() {
             return Err(anyhow!("command arguments cannot be empty"));
         }
 
         let args = request.args;
-        let input = request.input.unwrap_or_default();
         let mut env = state.env.clone();
         if let Some(overrides) = request.env {
             env.extend(overrides);
@@ -1871,12 +1825,13 @@ impl PackageCatalog {
         let cwd = request.cwd.unwrap_or_else(|| state.cwd.clone());
         let cwd = normalize_path(&cwd)?;
         validate_directory(&state.fs, &cwd, "cwd")?;
-        let wall_time = match state.limits.wall_time_seconds {
+        let wall_time = match request.limits.wall_time_seconds {
             Some(seconds) => Some(duration_from_seconds(seconds)?),
             None => None,
         };
         let target = match self.resolve_command(state, &args[0], &cwd, env.get("PATH"))? {
             ResolvedCommand::Virtual(target) => {
+                let input = self.read_stdin_to_end(streams.stdin)?;
                 return self.run_virtual_command(
                     args,
                     input,
@@ -1895,18 +1850,16 @@ impl PackageCatalog {
             .get(&target.package)
             .ok_or_else(|| anyhow!("package not loaded: {}", target.package))?;
 
-        let stdout = CapturedOutput::new(state.limits.output_bytes);
-        let stderr = CapturedOutput::new(state.limits.output_bytes);
-        let stdin = StaticFile::new(input);
-
         let injected_packages = self.injected_packages(&target.package);
+        let stdout = streams.stdout;
+        let stderr = streams.stderr;
 
         let run_result = self.run_package_command(
             ProcessIo {
                 args: args.iter().skip(1).cloned().collect(),
                 env,
                 cwd,
-                stdin: Box::new(stdin),
+                stdin: streams.stdin,
                 stdout: Box::new(stdout.file()),
                 stderr: Box::new(stderr.file()),
             },
@@ -1930,6 +1883,20 @@ impl PackageCatalog {
             returncode,
             stdout,
             stderr,
+        })
+    }
+
+    fn read_stdin_to_end(
+        &self,
+        mut stdin: Box<dyn VirtualFile + Send + Sync + 'static>,
+    ) -> Result<Vec<u8>> {
+        self.block_on(async move {
+            let mut input = Vec::new();
+            stdin
+                .read_to_end(&mut input)
+                .await
+                .context("unable to read process stdin")?;
+            Ok(input)
         })
     }
 
@@ -2041,7 +2008,7 @@ impl PackageCatalog {
         command_name: &str,
         package: &BinaryPackage,
         injected_packages: Vec<BinaryPackage>,
-        root_fs: TmpFileSystem,
+        root_fs: MemoryFileSystem,
         events: EventBus,
         virtual_executables: VirtualExecutableRegistry,
         wall_time: Option<Duration>,
@@ -2160,35 +2127,32 @@ impl PackageCatalog {
 fn process_package_files(
     package: &BinaryPackage,
     injected_packages: &[BinaryPackage],
-) -> Result<Option<UnionFileSystem>> {
-    let mut package_files = package.webc_fs.as_deref().map(UnionFileSystem::duplicate);
-    for injected_package in injected_packages {
-        let Some(injected_files) = injected_package.webc_fs.as_deref() else {
+) -> Result<MountFileSystem> {
+    let files = MountFileSystem::new();
+    // The command's package owns conflicting mounts; injected packages fill the rest.
+    for package in std::iter::once(package).chain(injected_packages) {
+        let Some(mounts) = &package.package_mounts else {
             continue;
         };
-        match &mut package_files {
-            Some(files) => files.merge(injected_files, UnionMergeMode::Skip)?,
-            None => package_files = Some(injected_files.duplicate()),
+        for entry in mounts.to_mount_fs()?.mount_entries() {
+            if files.filesystem_at(&entry.path).is_some() {
+                continue;
+            }
+            files.mount_with_source(entry.path, entry.source_path, entry.fs)?;
         }
     }
-    Ok(package_files)
+    Ok(files)
 }
 
 fn process_filesystem(
-    root_fs: TmpFileSystem,
-    package_files: Option<UnionFileSystem>,
+    root_fs: MemoryFileSystem,
+    package_files: MountFileSystem,
     events: EventBus,
     virtual_executables: VirtualExecutableRegistry,
     wall_time: Option<Duration>,
     cancellation: CancellationToken,
 ) -> Arc<dyn FileSystem + Send + Sync> {
-    let filesystem: Arc<dyn FileSystem + Send + Sync> = match package_files {
-        Some(files) => {
-            let overlay = OverlayFileSystem::new(root_fs, [RelativeOrAbsolutePathHack(files)]);
-            Arc::new(overlay)
-        }
-        None => Arc::new(root_fs),
-    };
+    let filesystem = Arc::new(OverlayFileSystem::new(root_fs, [package_files]));
     let filesystem = Arc::new(VirtualExecutableFileSystem::new(
         filesystem,
         virtual_executables,
@@ -2199,7 +2163,24 @@ fn process_filesystem(
 }
 
 #[derive(Clone, Debug)]
-struct CapturedOutput {
+pub(crate) struct InteractiveStdin {
+    state: Arc<Mutex<InteractiveStdinState>>,
+}
+
+#[derive(Debug)]
+struct InteractiveStdinState {
+    data: VecDeque<u8>,
+    closed: bool,
+    waker: Option<Waker>,
+}
+
+#[derive(Debug)]
+pub(crate) struct InteractiveStdinFile {
+    state: Arc<Mutex<InteractiveStdinState>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CapturedOutput {
     state: Arc<Mutex<CapturedOutputState>>,
 }
 
@@ -2216,8 +2197,172 @@ struct LimitedCaptureFile {
     cursor: u64,
 }
 
+impl InteractiveStdin {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(InteractiveStdinState {
+                data: VecDeque::new(),
+                closed: false,
+                waker: None,
+            })),
+        }
+    }
+
+    pub(crate) fn file(&self) -> InteractiveStdinFile {
+        InteractiveStdinFile {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    pub(crate) fn write(&self, data: Vec<u8>) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process stdin lock failed"))?;
+        if state.closed {
+            return Err(anyhow!("process stdin is closed"));
+        }
+        state.data.extend(data);
+        if let Some(waker) = state.waker.take() {
+            waker.wake();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn close(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process stdin lock failed"))?;
+        state.closed = true;
+        if let Some(waker) = state.waker.take() {
+            waker.wake();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_closed(&self) -> Result<bool> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("process stdin lock failed"))?;
+        Ok(state.closed)
+    }
+}
+
+impl AsyncSeek for InteractiveStdinFile {
+    fn start_seek(self: Pin<&mut Self>, _position: SeekFrom) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "process stdin is not seekable",
+        ))
+    }
+
+    fn poll_complete(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<u64>> {
+        Poll::Ready(Ok(0))
+    }
+}
+
+impl AsyncRead for InteractiveStdinFile {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return Poll::Ready(Err(io::Error::other("process stdin lock failed"))),
+        };
+        if state.data.is_empty() && state.closed {
+            return Poll::Ready(Ok(()));
+        }
+        if state.data.is_empty() {
+            state.waker = Some(cx.waker().clone());
+            return Poll::Pending;
+        }
+
+        let read_len = buf.remaining().min(state.data.len());
+        let data = state.data.drain(..read_len).collect::<Vec<_>>();
+        buf.put_slice(&data);
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for InteractiveStdinFile {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+        _buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(io::ErrorKind::PermissionDenied.into()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl VirtualFile for InteractiveStdinFile {
+    fn last_accessed(&self) -> u64 {
+        1_000_000_000
+    }
+
+    fn last_modified(&self) -> u64 {
+        1_000_000_000
+    }
+
+    fn created_time(&self) -> u64 {
+        1_000_000_000
+    }
+
+    fn size(&self) -> u64 {
+        self.state
+            .lock()
+            .map(|state| state.data.len() as u64)
+            .unwrap_or_default()
+    }
+
+    fn set_len(&mut self, _new_size: u64) -> virtual_fs::Result<()> {
+        Err(FsError::PermissionDenied)
+    }
+
+    fn unlink(&mut self) -> virtual_fs::Result<()> {
+        Err(FsError::PermissionDenied)
+    }
+
+    fn poll_read_ready(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<usize>> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return Poll::Ready(Err(io::Error::other("process stdin lock failed"))),
+        };
+        if !state.data.is_empty() {
+            return Poll::Ready(Ok(state.data.len()));
+        }
+        if state.closed {
+            return Poll::Ready(Ok(0));
+        }
+        state.waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+
+    fn poll_write_ready(
+        self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Err(io::ErrorKind::PermissionDenied.into()))
+    }
+}
+
 impl CapturedOutput {
-    fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize) -> Self {
         Self {
             state: Arc::new(Mutex::new(CapturedOutputState {
                 data: Vec::new(),
@@ -2234,7 +2379,7 @@ impl CapturedOutput {
         }
     }
 
-    fn capture(&self, stream_name: &str) -> Result<Vec<u8>> {
+    pub(crate) fn capture(&self, stream_name: &str) -> Result<Vec<u8>> {
         let state = self
             .state
             .lock()
@@ -2625,7 +2770,7 @@ fn duration_from_seconds(seconds: f64) -> Result<Duration> {
     Ok(Duration::from_secs_f64(seconds))
 }
 
-fn create_default_layout(catalog: &PackageCatalog, fs: &TmpFileSystem) -> Result<()> {
+fn create_default_layout(catalog: &PackageCatalog, fs: &MemoryFileSystem) -> Result<()> {
     for path in [
         "/bin",
         "/usr",
@@ -2774,7 +2919,7 @@ fn current_time_nanos() -> u64 {
         .unwrap_or(0)
 }
 
-fn write_file_to_fs_blocking(fs: &TmpFileSystem, path: &Path, data: Vec<u8>) -> Result<()> {
+fn write_file_to_fs_blocking(fs: &MemoryFileSystem, path: &Path, data: Vec<u8>) -> Result<()> {
     create_parent_directories(fs, path)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -2802,7 +2947,7 @@ fn command_path_from_path_entry(directory: &str, command: &str, cwd: &Path) -> R
     normalize_command_path(command_path, cwd)
 }
 
-fn validate_directory(fs: &TmpFileSystem, path: &Path, name: &str) -> Result<()> {
+fn validate_directory(fs: &MemoryFileSystem, path: &Path, name: &str) -> Result<()> {
     let metadata = match fs.metadata(path) {
         Ok(metadata) => metadata,
         Err(FsError::EntryNotFound) => {
@@ -2853,7 +2998,7 @@ fn validate_host_mount_source(path: &str) -> Result<PathBuf> {
         .with_context(|| format!("unable to resolve host mount source {}", path.display()))
 }
 
-fn create_parent_directories(fs: &TmpFileSystem, path: &Path) -> Result<()> {
+fn create_parent_directories(fs: &MemoryFileSystem, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         create_dir_all(fs, parent)
             .with_context(|| format!("unable to create {}", parent.display()))?;
@@ -2861,7 +3006,7 @@ fn create_parent_directories(fs: &TmpFileSystem, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn create_directories(fs: &TmpFileSystem, path: &Path) -> Result<Vec<PathBuf>> {
+fn create_directories(fs: &MemoryFileSystem, path: &Path) -> Result<Vec<PathBuf>> {
     let mut current = PathBuf::from("/");
     let mut created_paths = Vec::new();
     for component in path.components() {
@@ -2887,14 +3032,14 @@ fn create_directories(fs: &TmpFileSystem, path: &Path) -> Result<Vec<PathBuf>> {
     Ok(created_paths)
 }
 
-async fn read_file_from_fs(fs: &TmpFileSystem, path: &Path) -> Result<Vec<u8>> {
+async fn read_file_from_fs(fs: &MemoryFileSystem, path: &Path) -> Result<Vec<u8>> {
     let mut file = fs.new_open_options().read(true).open(path)?;
     let mut contents = Vec::new();
     file.read_to_end(&mut contents).await?;
     Ok(contents)
 }
 
-async fn write_file_to_fs(fs: &TmpFileSystem, path: &Path, data: Vec<u8>) -> Result<()> {
+async fn write_file_to_fs(fs: &MemoryFileSystem, path: &Path, data: Vec<u8>) -> Result<()> {
     let mut file = fs
         .new_open_options()
         .create(true)

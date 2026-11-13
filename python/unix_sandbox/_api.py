@@ -1,5 +1,7 @@
 """Typed Python facade for the Rust sandbox runtime."""
 
+from __future__ import annotations
+
 import asyncio
 import base64
 import contextlib
@@ -16,12 +18,12 @@ import urllib.request
 import weakref
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import Enum
 from importlib import resources
-from importlib.resources.abc import Traversable
+from importlib.abc import Traversable
 from pathlib import Path
 from types import TracebackType
-from typing import Self
+from typing import TYPE_CHECKING, cast
 
 from . import _native
 
@@ -40,11 +42,19 @@ STANDARD_PACKAGE_NAMES = (
 )
 
 
+class _WallTimeSecondsUnset:
+    """Sentinel for omitted per-process wall-time overrides."""
+
+
+_WALL_TIME_SECONDS_UNSET = _WallTimeSecondsUnset()
+_DEFAULT_WALL_TIME_SECONDS_ARG = cast("float | None", _WALL_TIME_SECONDS_UNSET)
+
+
 class SandboxError(RuntimeError):
     """Error raised when a sandbox operation cannot be completed."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class File:
     """A file to place in the sandbox filesystem.
 
@@ -54,7 +64,7 @@ class File:
     data: bytes
 
     @classmethod
-    def text(cls, text: str, encoding: str = "utf-8") -> Self:
+    def text(cls, text: str, encoding: str = "utf-8") -> File:
         """:param text: Text to encode into the file.
         :param encoding: Encoding to use.
         :returns: File instance containing encoded text.
@@ -62,19 +72,19 @@ class File:
         return cls(text.encode(encoding))
 
     @classmethod
-    def bytes(cls, data: bytes) -> Self:
+    def bytes(cls, data: bytes) -> File:
         """:param data: File bytes.
         :returns: File instance containing the supplied bytes.
         """
         return cls(data)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class Directory:
     """A directory to create in the sandbox filesystem."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class HostMount:
     """A live host directory mount inside the sandbox filesystem.
 
@@ -101,7 +111,15 @@ class HostMount:
         return (str(Path(self.source).expanduser()), self.target, self.read_only)
 
 
-class PackageSource(StrEnum):
+class _StringEnum(str, Enum):
+    """String-valued enum with ``StrEnum``-style string conversion."""
+
+    def __str__(self) -> str:
+        """:returns: The enum value."""
+        return cast(str, self.value)
+
+
+class PackageSource(_StringEnum):
     """Sources from which a Wasmer package can be loaded."""
 
     BUNDLED = "bundled"
@@ -109,7 +127,7 @@ class PackageSource(StrEnum):
     URL = "url"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class PackageCommandAlias:
     """An additional command name exposed for a package command.
 
@@ -126,10 +144,13 @@ class PackageCommandAlias:
         _validate_package_command_name(self.command, "command")
 
 
-PackageCommandAliasInput = PackageCommandAlias | tuple[str, str]
+if TYPE_CHECKING:
+    PackageCommandAliasInput = PackageCommandAlias | tuple[str, str]
+else:
+    PackageCommandAliasInput = object
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class WasmerPackage:
     """A Wasmer WEBC package available inside a sandbox image.
 
@@ -191,7 +212,7 @@ class WasmerPackage:
         name: str,
         *,
         command_aliases: Iterable[PackageCommandAliasInput] = (),
-    ) -> Self:
+    ) -> WasmerPackage:
         """:param name: Bundled package name.
         :param command_aliases: Additional command aliases exposed on PATH.
         :returns: Package loaded from the package's bundled assets.
@@ -210,7 +231,7 @@ class WasmerPackage:
         *,
         sha256: str | None = None,
         command_aliases: Iterable[PackageCommandAliasInput] = (),
-    ) -> Self:
+    ) -> WasmerPackage:
         """:param name: Logical package name.
         :param path: Local WEBC path.
         :param sha256: Expected WEBC SHA-256 digest.
@@ -233,7 +254,7 @@ class WasmerPackage:
         *,
         sha256: str,
         command_aliases: Iterable[PackageCommandAliasInput] = (),
-    ) -> Self:
+    ) -> WasmerPackage:
         """:param name: Logical package name.
         :param url: URL for a WEBC package.
         :param sha256: Expected WEBC SHA-256 digest.
@@ -249,7 +270,7 @@ class WasmerPackage:
         )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class SandboxImage:
     """Composable package image used to create sandbox process environments.
 
@@ -269,7 +290,7 @@ class SandboxImage:
         object.__setattr__(self, "packages", packages)
 
     @classmethod
-    def standard(cls) -> Self:
+    def standard(cls) -> SandboxImage:
         """:returns: Standard UNIX-like image bundled with this package."""
         return cls(
             tuple(
@@ -286,24 +307,24 @@ class SandboxImage:
         )
 
     @classmethod
-    def empty(cls) -> Self:
+    def empty(cls) -> SandboxImage:
         """:returns: Empty image with no Wasmer packages."""
         return cls()
 
     @classmethod
-    def from_packages(cls, packages: Iterable[WasmerPackage]) -> Self:
+    def from_packages(cls, packages: Iterable[WasmerPackage]) -> SandboxImage:
         """:param packages: Packages to include.
         :returns: Image containing the supplied packages.
         """
         return cls(tuple(packages))
 
-    def with_packages(self, *packages: WasmerPackage) -> Self:
+    def with_packages(self, *packages: WasmerPackage) -> SandboxImage:
         """:param packages: Packages to append to the image.
         :returns: Image with the supplied packages appended.
         """
         return type(self)((*self.packages, *packages))
 
-    def without(self, *names: str) -> Self:
+    def without(self, *names: str) -> SandboxImage:
         """:param names: Package names to remove.
         :returns: Image without packages matching the supplied names.
         """
@@ -313,7 +334,7 @@ class SandboxImage:
         )
 
 
-class SandboxEventKind(StrEnum):
+class SandboxEventKind(_StringEnum):
     """Filesystem event kinds emitted by a sandbox."""
 
     FILE_CREATED = "file_created"
@@ -326,7 +347,7 @@ class SandboxEventKind(StrEnum):
     EVENTS_DROPPED = "events_dropped"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class SandboxEvent:
     """A filesystem event emitted by a sandbox.
 
@@ -344,7 +365,7 @@ class SandboxEvent:
     dropped_count: int = 0
 
     @classmethod
-    def _from_native(cls, event: tuple[int, str, str, str | None, int]) -> Self:
+    def _from_native(cls, event: tuple[int, str, str, str | None, int]) -> SandboxEvent:
         """:param event: Native event tuple.
         :returns: Python event object.
         """
@@ -358,10 +379,13 @@ class SandboxEvent:
         )
 
 
-FilesystemEventHandler = Callable[[SandboxEvent], Awaitable[None] | None]
+if TYPE_CHECKING:
+    FilesystemEventHandler = Callable[[SandboxEvent], Awaitable[None] | None]
+else:
+    FilesystemEventHandler = Callable[[SandboxEvent], object]
 
 
-@dataclass(slots=True)
+@dataclass
 class _EventHandlerRegistration:
     """A registered event handler and its delivery filter.
 
@@ -384,11 +408,11 @@ class _EventHandlerRegistration:
 class EventSubscription:
     """A handle for removing a sandbox event handler."""
 
-    _sandbox: "Sandbox"
+    _sandbox: Sandbox
     _token: int
     _closed: bool
 
-    def __init__(self, sandbox: "Sandbox", token: int) -> None:
+    def __init__(self, sandbox: Sandbox, token: int) -> None:
         """:param sandbox: Sandbox that owns the handler.
         :param token: Handler token to remove.
         """
@@ -413,7 +437,7 @@ class EventSubscription:
         self.close()
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class CompletedProcess:
     """A finished sandbox process.
 
@@ -444,6 +468,187 @@ class CompletedProcess:
             return
         raise SandboxError(
             f"command {self.args!r} returned non-zero exit status {self.returncode}"
+        )
+
+
+class SandboxProcess:
+    """A running sandbox process with writable standard input."""
+
+    _native_process: _native.StartedProcess
+    _completed_process: CompletedProcess | None
+
+    def __init__(self, native_process: _native.StartedProcess) -> None:
+        """:param native_process: Native process handle."""
+        self._native_process = native_process
+        self._completed_process = None
+
+    def __del__(self) -> None:
+        """Release a running process if the handle is abandoned."""
+        try:
+            if self._completed_process is not None:
+                return
+            if not self._native_process.is_running():
+                return
+            self._native_process.cancel()
+            self._native_process.wait_blocking()
+        except Exception:
+            LOGGER.debug("sandbox process destructor cleanup failed\n%s", traceback.format_exc())
+
+    async def __aenter__(self) -> SandboxProcess:
+        """:returns: This running process."""
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        """:param exc_type: Exception type raised in the context.
+        :param exc_value: Exception value raised in the context.
+        :param traceback: Traceback raised in the context.
+        """
+        await self.aclose()
+
+    @property
+    def args(self) -> tuple[str, ...]:
+        """:returns: Command arguments."""
+        return tuple(self._native_process.args)
+
+    @property
+    def returncode(self) -> int | None:
+        """:returns: Process return code when the process has finished."""
+        if self._completed_process is not None:
+            return self._completed_process.returncode
+        return self._native_process.returncode
+
+    @property
+    def running(self) -> bool:
+        """:returns: Whether the process is still running."""
+        return self._native_process.is_running()
+
+    @property
+    def stdin_closed(self) -> bool:
+        """:returns: Whether standard input has been closed."""
+        try:
+            return self._native_process.stdin_closed
+        except RuntimeError as error:
+            raise SandboxError(str(error)) from error
+
+    @property
+    def stdout(self) -> bytes:
+        """:returns: Captured standard output produced so far."""
+        try:
+            return self._native_process.stdout
+        except RuntimeError as error:
+            raise SandboxError(str(error)) from error
+
+    @property
+    def stderr(self) -> bytes:
+        """:returns: Captured standard error produced so far."""
+        try:
+            return self._native_process.stderr
+        except RuntimeError as error:
+            raise SandboxError(str(error)) from error
+
+    @property
+    def stdout_text(self) -> str:
+        """:returns: Captured standard output produced so far decoded as UTF-8."""
+        return self.stdout.decode()
+
+    @property
+    def stderr_text(self) -> str:
+        """:returns: Captured standard error produced so far decoded as UTF-8."""
+        return self.stderr.decode()
+
+    def write_stdin_nowait(self, data: bytes | str, encoding: str = "utf-8") -> None:
+        """:param data: Bytes or text to write to standard input.
+        :param encoding: Encoding to use for text input.
+        """
+        data_bytes = data.encode(encoding) if isinstance(data, str) else data
+        try:
+            self._native_process.write_stdin(data_bytes)
+        except RuntimeError as error:
+            raise SandboxError(str(error)) from error
+
+    async def write_stdin(self, data: bytes | str, encoding: str = "utf-8") -> None:
+        """:param data: Bytes or text to write to standard input.
+        :param encoding: Encoding to use for text input.
+        """
+        self.write_stdin_nowait(data, encoding)
+
+    def close_stdin_nowait(self) -> None:
+        """Close standard input."""
+        try:
+            self._native_process.close_stdin()
+        except RuntimeError as error:
+            raise SandboxError(str(error)) from error
+
+    async def close_stdin(self) -> None:
+        """Close standard input."""
+        self.close_stdin_nowait()
+
+    def cancel(self) -> None:
+        """Cancel the running process."""
+        self._native_process.cancel()
+
+    def terminate(self) -> None:
+        """Cancel the running process."""
+        self.cancel()
+
+    def kill(self) -> None:
+        """Cancel the running process."""
+        self.cancel()
+
+    async def aclose(self) -> None:
+        """Cancel the process and wait for native cleanup."""
+        self.cancel()
+        try:
+            await self.wait()
+        except asyncio.CancelledError:
+            with contextlib.suppress(SandboxError):
+                await self.wait()
+            raise
+        except SandboxError:
+            return
+
+    async def wait(self, *, check: bool = False) -> CompletedProcess:
+        """:param check: Whether to raise on a non-zero return code.
+        :returns: Completed process details.
+        :raises SandboxError: Raised when the process fails or check is true and the command fails.
+        """
+        if self._completed_process is None:
+            self._completed_process = await self._wait_native()
+        if check:
+            self._completed_process.check_returncode()
+        return self._completed_process
+
+    async def communicate(
+        self,
+        input: bytes | str | None = None,
+        *,
+        check: bool = False,
+    ) -> CompletedProcess:
+        """:param input: Bytes or text to write before closing standard input.
+        :param check: Whether to raise on a non-zero return code.
+        :returns: Completed process details.
+        """
+        if input is not None:
+            await self.write_stdin(input)
+        await self.close_stdin()
+        return await self.wait(check=check)
+
+    async def _wait_native(self) -> CompletedProcess:
+        """:returns: Completed process details from the native handle."""
+        try:
+            native_result = await self._native_process.wait()
+        except RuntimeError as error:
+            raise SandboxError(str(error)) from error
+        return CompletedProcess(
+            args=tuple(native_result.args),
+            returncode=native_result.returncode,
+            stdout=native_result.stdout,
+            stderr=native_result.stderr,
         )
 
 
@@ -483,7 +688,7 @@ class VirtualProcessOutput:
         return b"".join(self._chunks)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class CommandResult:
     """A result returned by a virtual executable handler.
 
@@ -497,7 +702,7 @@ class CommandResult:
     stderr: bytes = b""
 
 
-@dataclass(slots=True)
+@dataclass
 class CommandInvocation:
     """A virtual executable invocation.
 
@@ -511,7 +716,7 @@ class CommandInvocation:
     :ivar stderr: Standard error stream.
     """
 
-    sandbox: "Sandbox"
+    sandbox: Sandbox
     executable_path: str
     argv: tuple[str, ...]
     cwd: str
@@ -532,12 +737,16 @@ class CommandInvocation:
         input: bytes | str | None = None,
         env: dict[str, str] | None = None,
         cwd: str | None = None,
+        limits: Limits | None = None,
+        wall_time_seconds: float | None = _DEFAULT_WALL_TIME_SECONDS_ARG,
         check: bool = False,
     ) -> CompletedProcess:
         """:param args: Command and arguments.
         :param input: Bytes or text to pass as stdin.
         :param env: Environment variable overrides.
         :param cwd: Working directory override.
+        :param limits: Complete per-process resource limits.
+        :param wall_time_seconds: Per-process wall-time override.
         :param check: Whether to raise on a non-zero return code.
         :returns: Completed process details.
         """
@@ -546,6 +755,8 @@ class CommandInvocation:
             input=input,
             env=env,
             cwd=self.cwd if cwd is None else cwd,
+            limits=limits,
+            wall_time_seconds=wall_time_seconds,
             check=check,
         )
 
@@ -569,14 +780,18 @@ class CommandInvocation:
         await self.sandbox.write_text(path, text, encoding)
 
 
-VirtualExecutableResult = int | CommandResult | CompletedProcess | None
-VirtualExecutableHandler = Callable[
-    [CommandInvocation],
-    Awaitable[VirtualExecutableResult] | VirtualExecutableResult,
-]
+if TYPE_CHECKING:
+    VirtualExecutableResult = int | CommandResult | CompletedProcess | None
+    VirtualExecutableHandler = Callable[
+        [CommandInvocation],
+        Awaitable[VirtualExecutableResult] | VirtualExecutableResult,
+    ]
+else:
+    VirtualExecutableResult = object
+    VirtualExecutableHandler = Callable[[CommandInvocation], object]
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class VirtualExecutable:
     """A host-backed executable exposed inside the sandbox.
 
@@ -599,11 +814,11 @@ class VirtualExecutable:
 class VirtualExecutableRegistration:
     """A handle for removing a virtual executable."""
 
-    _sandbox: "Sandbox"
+    _sandbox: Sandbox
     _token: int
     _closed: bool
 
-    def __init__(self, sandbox: "Sandbox", token: int) -> None:
+    def __init__(self, sandbox: Sandbox, token: int) -> None:
         """:param sandbox: Sandbox that owns the virtual executable.
         :param token: Handler token to remove.
         """
@@ -628,7 +843,7 @@ class VirtualExecutableRegistration:
         self.close()
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class Limits:
     """Resource limits applied to sandbox process execution.
 
@@ -650,7 +865,30 @@ class Limits:
         raise ValueError("wall_time_seconds must be a positive finite number")
 
 
-@dataclass(frozen=True, slots=True)
+def _resolve_process_limits(
+    default_limits: Limits,
+    limits: Limits | None,
+    wall_time_seconds: float | _WallTimeSecondsUnset | None,
+) -> Limits:
+    """:param default_limits: Sandbox-level process limits.
+    :param limits: Complete per-process limit override.
+    :param wall_time_seconds: Per-process wall-time override.
+    :returns: Limits to apply to a single process.
+    :raises ValueError: Raised when both override forms are supplied.
+    """
+    if limits is not None and not isinstance(wall_time_seconds, _WallTimeSecondsUnset):
+        raise ValueError("limits and wall_time_seconds cannot both be set")
+    if limits is not None:
+        return limits
+    if isinstance(wall_time_seconds, _WallTimeSecondsUnset):
+        return default_limits
+    return Limits(
+        output_bytes=default_limits.output_bytes,
+        wall_time_seconds=wall_time_seconds,
+    )
+
+
+@dataclass(frozen=True)
 class SandboxConfig:
     """Configuration for a sandbox instance.
 
@@ -722,8 +960,6 @@ class Sandbox:
                 packages,
                 self._config.cwd,
                 self._config.env,
-                self._config.limits.output_bytes,
-                self._config.limits.wall_time_seconds,
                 self._config.event_queue_size,
             )
         except RuntimeError as error:
@@ -745,7 +981,7 @@ class Sandbox:
         except Exception:
             LOGGER.debug("sandbox destructor cleanup failed\n%s", traceback.format_exc())
 
-    async def __aenter__(self) -> Self:
+    async def __aenter__(self) -> Sandbox:
         """:returns: This sandbox."""
         return self
 
@@ -759,8 +995,16 @@ class Sandbox:
         :param exc_value: Exception value raised in the context.
         :param traceback: Traceback raised in the context.
         """
-        self._shutdown_event_handlers()
-        self.close_virtual_executables()
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        """Close event handlers and virtual executable dispatch tasks."""
+        tasks = self._async_tasks()
+        try:
+            self._shutdown_event_handlers()
+            self.close_virtual_executables()
+        finally:
+            await _drain_cancelled_tasks(tasks)
 
     def register_executable(
         self,
@@ -812,11 +1056,9 @@ class Sandbox:
         self._cancel_virtual_executable_requests()
         task = self._virtual_executable_dispatch_task
         self._virtual_executable_dispatch_task = None
-        if task is None:
+        if task is None or task.done():
             return
-        if task.done():
-            return
-        task.cancel()
+        _cancel_task(task)
 
     def _ensure_virtual_executable_dispatcher(self) -> None:
         """:raises RuntimeError: Raised when no asyncio loop is running."""
@@ -836,7 +1078,7 @@ class Sandbox:
         for task in tuple(self._virtual_executable_request_tasks.values()):
             if task.done():
                 continue
-            task.cancel()
+            _cancel_task(task)
 
     def _start_virtual_process_request(self, request_id: int, payload: bytes) -> None:
         """:param request_id: Native request identifier.
@@ -883,8 +1125,11 @@ class Sandbox:
             )
             if cancellation_task in done:
                 handler_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await handler_task
+                await _await_cancelled_handler(handler_task)
+                self._complete_virtual_process(
+                    request_id,
+                    _encode_virtual_executable_response(_virtual_handler_cancelled_result()),
+                )
                 return
 
             response = await handler_task
@@ -895,8 +1140,7 @@ class Sandbox:
         except asyncio.CancelledError:
             handler_task.cancel()
             cancellation_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await handler_task
+            await _await_cancelled_handler(handler_task)
             with contextlib.suppress(asyncio.CancelledError):
                 await cancellation_task
             self._complete_virtual_process(
@@ -997,11 +1241,9 @@ class Sandbox:
         self._event_dispatch_generation += 1
         task = self._event_dispatch_task
         self._event_dispatch_task = None
-        if task is None:
+        if task is None or task.done():
             return
-        if task.done():
-            return
-        task.cancel()
+        _cancel_task(task)
 
     def _remove_event_subscription(self, token: int) -> None:
         """:param token: Handler token to remove."""
@@ -1035,6 +1277,10 @@ class Sandbox:
                 for registration in tuple(self._event_handlers.values()):
                     if _event_matches(registration, event):
                         self._queue_event_delivery(registration, event)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.error("sandbox event dispatcher failed\n%s", traceback.format_exc())
         finally:
             if self._event_dispatch_generation == generation:
                 self._native_sandbox.set_event_notifications_enabled(False)
@@ -1076,7 +1322,18 @@ class Sandbox:
         """:param registration: Handler registration to stop."""
         if registration.worker_task.done():
             return
-        registration.worker_task.cancel()
+        _cancel_task(registration.worker_task)
+
+    def _async_tasks(self) -> tuple[asyncio.Task[None], ...]:
+        """:returns: Async tasks owned by this sandbox."""
+        tasks: list[asyncio.Task[None]] = []
+        if self._event_dispatch_task is not None:
+            tasks.append(self._event_dispatch_task)
+        if self._virtual_executable_dispatch_task is not None:
+            tasks.append(self._virtual_executable_dispatch_task)
+        tasks.extend(registration.worker_task for registration in self._event_handlers.values())
+        tasks.extend(self._virtual_executable_request_tasks.values())
+        return tuple(tasks)
 
     def _queue_event_delivery(
         self,
@@ -1102,6 +1359,91 @@ class Sandbox:
             return
         registration.dropped_count += 1
 
+    def start(
+        self,
+        args: list[str] | tuple[str, ...],
+        *,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+        limits: Limits | None = None,
+        wall_time_seconds: float | None = _DEFAULT_WALL_TIME_SECONDS_ARG,
+    ) -> SandboxProcess:
+        """:param args: Command and arguments.
+        :param env: Environment variable overrides.
+        :param cwd: Working directory override.
+        :param limits: Complete per-process resource limits.
+        :param wall_time_seconds: Per-process wall-time override.
+        :returns: Running process handle.
+        """
+        process_limits = _resolve_process_limits(
+            self._config.limits,
+            limits,
+            wall_time_seconds,
+        )
+        self._ensure_virtual_executable_dispatcher()
+        process_token = self._next_process_token
+        self._next_process_token += 1
+        try:
+            native_process = self._native_sandbox.start(
+                process_token,
+                list(args),
+                env,
+                cwd,
+                process_limits.output_bytes,
+                process_limits.wall_time_seconds,
+            )
+        except RuntimeError as error:
+            raise SandboxError(str(error)) from error
+        return SandboxProcess(native_process)
+
+    def spawn(
+        self,
+        args: list[str] | tuple[str, ...],
+        *,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+        limits: Limits | None = None,
+        wall_time_seconds: float | None = _DEFAULT_WALL_TIME_SECONDS_ARG,
+    ) -> SandboxProcess:
+        """:param args: Command and arguments.
+        :param env: Environment variable overrides.
+        :param cwd: Working directory override.
+        :param limits: Complete per-process resource limits.
+        :param wall_time_seconds: Per-process wall-time override.
+        :returns: Running process handle.
+        """
+        return self.start(
+            args,
+            env=env,
+            cwd=cwd,
+            limits=limits,
+            wall_time_seconds=wall_time_seconds,
+        )
+
+    def popen(
+        self,
+        args: list[str] | tuple[str, ...],
+        *,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+        limits: Limits | None = None,
+        wall_time_seconds: float | None = _DEFAULT_WALL_TIME_SECONDS_ARG,
+    ) -> SandboxProcess:
+        """:param args: Command and arguments.
+        :param env: Environment variable overrides.
+        :param cwd: Working directory override.
+        :param limits: Complete per-process resource limits.
+        :param wall_time_seconds: Per-process wall-time override.
+        :returns: Running process handle.
+        """
+        return self.start(
+            args,
+            env=env,
+            cwd=cwd,
+            limits=limits,
+            wall_time_seconds=wall_time_seconds,
+        )
+
     async def run(
         self,
         args: list[str] | tuple[str, ...],
@@ -1109,17 +1451,26 @@ class Sandbox:
         input: bytes | str | None = None,
         env: dict[str, str] | None = None,
         cwd: str | None = None,
+        limits: Limits | None = None,
+        wall_time_seconds: float | None = _DEFAULT_WALL_TIME_SECONDS_ARG,
         check: bool = False,
     ) -> CompletedProcess:
         """:param args: Command and arguments.
         :param input: Bytes or text to pass as stdin.
         :param env: Environment variable overrides.
         :param cwd: Working directory override.
+        :param limits: Complete per-process resource limits.
+        :param wall_time_seconds: Per-process wall-time override.
         :param check: Whether to raise on a non-zero return code.
         :returns: Completed process details.
         :raises SandboxError: Raised when check is true and the command fails.
         """
         input_bytes = input.encode() if isinstance(input, str) else input
+        process_limits = _resolve_process_limits(
+            self._config.limits,
+            limits,
+            wall_time_seconds,
+        )
         self._ensure_virtual_executable_dispatcher()
         process_token = self._next_process_token
         self._next_process_token += 1
@@ -1130,6 +1481,8 @@ class Sandbox:
                 input_bytes,
                 env,
                 cwd,
+                process_limits.output_bytes,
+                process_limits.wall_time_seconds,
             )
         )
         try:
@@ -1172,15 +1525,27 @@ class Sandbox:
         input: bytes | str | None = None,
         env: dict[str, str] | None = None,
         cwd: str | None = None,
+        limits: Limits | None = None,
+        wall_time_seconds: float | None = _DEFAULT_WALL_TIME_SECONDS_ARG,
     ) -> bytes:
         """:param args: Command and arguments.
         :param input: Bytes or text to pass as stdin.
         :param env: Environment variable overrides.
         :param cwd: Working directory override.
+        :param limits: Complete per-process resource limits.
+        :param wall_time_seconds: Per-process wall-time override.
         :returns: Captured stdout bytes.
         :raises SandboxError: Raised when the command fails.
         """
-        result = await self.run(args, input=input, env=env, cwd=cwd, check=True)
+        result = await self.run(
+            args,
+            input=input,
+            env=env,
+            cwd=cwd,
+            limits=limits,
+            wall_time_seconds=wall_time_seconds,
+            check=True,
+        )
         return result.stdout
 
     async def check_output_text(
@@ -1190,17 +1555,28 @@ class Sandbox:
         input: bytes | str | None = None,
         env: dict[str, str] | None = None,
         cwd: str | None = None,
+        limits: Limits | None = None,
+        wall_time_seconds: float | None = _DEFAULT_WALL_TIME_SECONDS_ARG,
         encoding: str = "utf-8",
     ) -> str:
         """:param args: Command and arguments.
         :param input: Bytes or text to pass as stdin.
         :param env: Environment variable overrides.
         :param cwd: Working directory override.
+        :param limits: Complete per-process resource limits.
+        :param wall_time_seconds: Per-process wall-time override.
         :param encoding: Encoding to use.
         :returns: Captured stdout text.
         :raises SandboxError: Raised when the command fails.
         """
-        data = await self.check_output(args, input=input, env=env, cwd=cwd)
+        data = await self.check_output(
+            args,
+            input=input,
+            env=env,
+            cwd=cwd,
+            limits=limits,
+            wall_time_seconds=wall_time_seconds,
+        )
         return data.decode(encoding)
 
     async def read_text(self, path: str, encoding: str = "utf-8") -> str:
@@ -1266,11 +1642,75 @@ async def _dispatch_virtual_processes(
             if sandbox is None:
                 return
             sandbox._start_virtual_process_request(request_id, payload)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        LOGGER.error(
+            "virtual executable dispatcher failed\n%s",
+            traceback.format_exc(),
+        )
     finally:
         sandbox = sandbox_reference()
         if sandbox is not None:
             sandbox._virtual_executable_dispatch_task = None
             sandbox._cancel_virtual_executable_requests()
+
+
+async def _await_cancelled_handler(task: asyncio.Task[bytes]) -> None:
+    """:param task: Handler task to wait after requesting cancellation."""
+    try:
+        await task
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        LOGGER.error(
+            "virtual executable handler cancellation failed\n%s",
+            traceback.format_exc(),
+        )
+
+
+def _cancel_task(task: asyncio.Task[object]) -> None:
+    """:param task: Task to cancel on its owning event loop."""
+    if task.done():
+        return
+    loop = task.get_loop()
+    if loop.is_closed():
+        return
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop.call_soon_threadsafe(task.cancel)
+        return
+    if running_loop is loop:
+        task.cancel()
+        return
+    loop.call_soon_threadsafe(task.cancel)
+
+
+async def _drain_cancelled_tasks(tasks: Iterable[asyncio.Task[object]]) -> None:
+    """:param tasks: Tasks that have been asked to shut down."""
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    current_task = asyncio.current_task()
+    local_tasks = [
+        task
+        for task in tasks
+        if not task.done() and task.get_loop() is running_loop and task is not current_task
+    ]
+    if len(local_tasks) == 0:
+        return
+    try:
+        results = await asyncio.gather(*local_tasks, return_exceptions=True)
+    except asyncio.CancelledError:
+        await asyncio.gather(*local_tasks, return_exceptions=True)
+        raise
+    for result in results:
+        if isinstance(result, asyncio.CancelledError):
+            continue
+        if isinstance(result, Exception):
+            LOGGER.error("sandbox task shutdown failed: %r", result)
 
 
 def _normalize_package_command_aliases(

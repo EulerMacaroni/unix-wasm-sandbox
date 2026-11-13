@@ -1,5 +1,9 @@
 import asyncio
+import contextlib
 import gzip
+import os
+import subprocess
+import sys
 from importlib import resources
 from pathlib import Path
 
@@ -18,6 +22,7 @@ from unix_sandbox import (
     SandboxEvent,
     SandboxEventKind,
     SandboxImage,
+    SandboxProcess,
     VirtualExecutable,
     WasmerPackage,
 )
@@ -34,6 +39,28 @@ async def wait_for_events(events: list[SandboxEvent], count: int) -> None:
             return
         await asyncio.sleep(0.05)
     raise AssertionError(f"expected at least {count} events, got {events!r}")
+
+
+async def wait_for_stdout(process: SandboxProcess, expected: bytes) -> None:
+    """Wait until a running process has captured expected stdout.
+
+    :param process: Running process to inspect.
+    :param expected: Expected stdout fragment.
+    """
+    for _ in range(100):
+        if expected in process.stdout:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"expected stdout to contain {expected!r}, got {process.stdout!r}")
+
+
+async def close_started_process(process: SandboxProcess) -> None:
+    """Cancel a started process and suppress cleanup errors.
+
+    :param process: Running process to close.
+    """
+    with contextlib.suppress(SandboxError):
+        await process.aclose()
 
 
 @pytest.mark.asyncio
@@ -58,6 +85,19 @@ async def test_python_process_runs_in_standard_image() -> None:
     sandbox = Sandbox()
     result = await sandbox.run(["python", "-c", "print(6 * 7)"], check=True)
     assert result.stdout_text == "42\n"
+
+
+@pytest.mark.asyncio
+async def test_python_stdin_heredoc_runs_non_interactively() -> None:
+    """Verify Python reads shell heredoc stdin as script input."""
+    sandbox = Sandbox()
+    result = await sandbox.run(
+        ["bash", "-lc", "python - << 'PY'\nprint('test')\nPY"],
+        check=True,
+        wall_time_seconds=120.0,
+    )
+    assert result.stdout_text == "test\n"
+    assert result.stderr_text == ""
 
 
 @pytest.mark.asyncio
@@ -249,6 +289,164 @@ async def test_process_stdin_stdout_and_returncode() -> None:
 
 
 @pytest.mark.asyncio
+async def test_started_process_accepts_interactive_stdin() -> None:
+    """Verify that stdin can be written after a process has started."""
+    sandbox = Sandbox()
+    process = sandbox.start(
+        [
+            "bash",
+            "-lc",
+            (
+                "IFS= read -r first\n"
+                "printf 'first:%s\\n' \"$first\"\n"
+                "IFS= read -r second\n"
+                "printf 'second:%s\\n' \"$second\"\n"
+            ),
+        ],
+    )
+    try:
+        assert process.args[0] == "bash"
+        assert process.running is True
+        assert process.returncode is None
+
+        await process.write_stdin("alpha\n")
+        await wait_for_stdout(process, b"first:alpha\n")
+        assert process.returncode is None
+
+        await process.write_stdin("beta\n")
+        await process.close_stdin()
+        result = await process.wait(check=True)
+
+        assert result.stdout_text == "first:alpha\nsecond:beta\n"
+        assert result.stderr == b""
+        assert process.stdout == result.stdout
+        assert process.stderr == b""
+        assert process.returncode == 0
+        assert process.running is False
+        assert process.stdin_closed is True
+    finally:
+        await close_started_process(process)
+
+
+@pytest.mark.asyncio
+async def test_started_process_wait_cancellation_does_not_cancel_process() -> None:
+    """Verify that cancelling a waiter leaves the process usable."""
+    sandbox = Sandbox()
+    process = sandbox.start(
+        [
+            "bash",
+            "-lc",
+            (
+                "printf 'ready\\n'\n"
+                "IFS= read -r line\n"
+                "printf 'done:%s\\n' \"$line\"\n"
+            ),
+        ],
+    )
+    try:
+        await wait_for_stdout(process, b"ready\n")
+
+        waiter = asyncio.create_task(process.wait())
+        await asyncio.sleep(0)
+        waiter.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+        assert process.running is True
+        await process.write_stdin("value\n")
+        await process.close_stdin()
+        result = await process.wait(check=True)
+
+        assert result.stdout_text == "ready\ndone:value\n"
+    finally:
+        await close_started_process(process)
+
+
+@pytest.mark.asyncio
+async def test_started_process_supports_concurrent_waiters() -> None:
+    """Verify that multiple waiters can observe the same process completion."""
+    sandbox = Sandbox()
+    process = sandbox.start(["cat"])
+    try:
+        first_waiter = asyncio.create_task(process.wait())
+        second_waiter = asyncio.create_task(process.wait())
+        await process.write_stdin("shared")
+        await process.close_stdin()
+        first_result, second_result = await asyncio.gather(first_waiter, second_waiter)
+
+        assert first_result == second_result
+        assert first_result.stdout_text == "shared"
+    finally:
+        await close_started_process(process)
+
+
+@pytest.mark.asyncio
+async def test_spawn_and_popen_communicate_close_stdin() -> None:
+    """Verify spawn and popen aliases support communicate-style input."""
+    sandbox = Sandbox()
+
+    spawned = sandbox.spawn(["cat"])
+    spawned_result = await spawned.communicate("spawned", check=True)
+
+    popened = sandbox.popen(["cat"])
+    popened_result = await popened.communicate(b"popened", check=True)
+
+    assert spawned_result.stdout_text == "spawned"
+    assert popened_result.stdout == b"popened"
+    assert spawned.stdin_closed is True
+    assert popened.stdin_closed is True
+
+
+@pytest.mark.asyncio
+async def test_started_process_can_be_cancelled() -> None:
+    """Verify that cancelling a started process stops the guest process."""
+    sandbox = Sandbox(SandboxConfig(limits=Limits(wall_time_seconds=None)))
+    process = sandbox.popen(["python", "-c", "import time; time.sleep(5)"])
+
+    process.terminate()
+
+    with pytest.raises(SandboxError, match="process cancelled"):
+        await process.wait()
+
+
+def test_abandoned_started_process_cleans_up_before_interpreter_exit(tmp_path: Path) -> None:
+    """Verify that an un-awaited started process does not crash interpreter shutdown."""
+    script = """
+import asyncio
+import gc
+
+from unix_sandbox import Sandbox
+
+
+async def main() -> None:
+    sandbox = Sandbox()
+    process = sandbox.start(["cat"])
+    await asyncio.sleep(0)
+    del process
+    gc.collect()
+    await asyncio.sleep(0)
+
+
+asyncio.run(main())
+"""
+    env: dict[str, str] = {
+        **os.environ,
+        "XDG_CACHE_HOME": str(tmp_path / "cache"),
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        env=env,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.asyncio
 async def test_python_process_receives_environment_and_cwd() -> None:
     """Verify per-process environment and working directory settings."""
     sandbox = Sandbox()
@@ -304,11 +502,82 @@ async def test_wall_time_limit_raises_sandbox_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_accepts_wall_time_override() -> None:
+    """Verify that one-shot commands can override the sandbox wall-time limit."""
+    sandbox = Sandbox(SandboxConfig(limits=Limits(wall_time_seconds=None)))
+    with pytest.raises(SandboxError, match="wall time limit"):
+        await sandbox.run(
+            ["python", "-c", "import time; time.sleep(1)"],
+            wall_time_seconds=0.05,
+        )
+
+
+@pytest.mark.asyncio
+async def test_process_limits_can_disable_default_wall_time() -> None:
+    """Verify that per-process limits can disable a sandbox-level timeout."""
+    sandbox = Sandbox(SandboxConfig(limits=Limits(wall_time_seconds=0.05)))
+    result = await sandbox.run(
+        ["python", "-c", "import time; time.sleep(0.15); print('ok')"],
+        limits=Limits(wall_time_seconds=None),
+        check=True,
+    )
+    assert result.stdout_text == "ok\n"
+
+
+@pytest.mark.asyncio
+async def test_wall_time_shortcut_can_disable_default_wall_time() -> None:
+    """Verify that an explicit None wall-time override disables the default timeout."""
+    sandbox = Sandbox(SandboxConfig(limits=Limits(wall_time_seconds=0.05)))
+    result = await sandbox.run(
+        ["python", "-c", "import time; time.sleep(0.15); print('ok')"],
+        wall_time_seconds=None,
+        check=True,
+    )
+    assert result.stdout_text == "ok\n"
+
+
+@pytest.mark.asyncio
+async def test_started_process_accepts_limit_override() -> None:
+    """Verify that started processes use per-process timeout limits."""
+    sandbox = Sandbox(SandboxConfig(limits=Limits(wall_time_seconds=None)))
+    process = sandbox.start(
+        ["python", "-c", "import time; time.sleep(1)"],
+        wall_time_seconds=0.05,
+    )
+    try:
+        with pytest.raises(SandboxError, match="wall time limit"):
+            await process.wait()
+    finally:
+        await close_started_process(process)
+
+
+@pytest.mark.asyncio
+async def test_process_limit_override_rejects_ambiguous_timeout_forms() -> None:
+    """Verify that the timeout shortcut cannot be mixed with complete limits."""
+    sandbox = Sandbox()
+    with pytest.raises(ValueError, match="limits and wall_time_seconds"):
+        await sandbox.run(["true"], limits=Limits(), wall_time_seconds=1.0)
+    with pytest.raises(ValueError, match="limits and wall_time_seconds"):
+        sandbox.start(["true"], limits=Limits(), wall_time_seconds=None)
+
+
+@pytest.mark.asyncio
 async def test_output_limit_raises_sandbox_error() -> None:
     """Verify that oversized captured output raises a sandbox error."""
     sandbox = Sandbox(SandboxConfig(limits=Limits(output_bytes=4)))
     with pytest.raises(SandboxError, match="output exceeded"):
         await sandbox.run(["python", "-c", "print('too long')"])
+
+
+@pytest.mark.asyncio
+async def test_run_accepts_output_limit_override() -> None:
+    """Verify that one-shot commands can override the sandbox output limit."""
+    sandbox = Sandbox(SandboxConfig(limits=Limits(output_bytes=1024, wall_time_seconds=None)))
+    with pytest.raises(SandboxError, match="output exceeded"):
+        await sandbox.run(
+            ["python", "-c", "print('too long')"],
+            limits=Limits(output_bytes=4, wall_time_seconds=None),
+        )
 
 
 @pytest.mark.asyncio
@@ -400,6 +669,35 @@ async def test_event_subscription_close_stops_delivery() -> None:
     await asyncio.sleep(0.1)
 
     assert events == []
+
+
+@pytest.mark.asyncio
+async def test_event_subscription_can_close_from_thread() -> None:
+    """Verify that subscription cleanup is safe from a non-loop thread."""
+    sandbox = Sandbox()
+    events: list[SandboxEvent] = []
+    subscription = sandbox.on_event(events.append, path_prefix="/work/thread-closed.txt")
+
+    await asyncio.to_thread(subscription.close)
+    await sandbox.write_text("/work/thread-closed.txt", "hidden")
+    await asyncio.sleep(0.1)
+    await sandbox.aclose()
+
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_sandbox_aclose_drains_event_tasks() -> None:
+    """Verify that sandbox async close waits for local event tasks to finish."""
+    sandbox = Sandbox()
+    events: list[SandboxEvent] = []
+    sandbox.on_event(events.append, path_prefix="/work/drained.txt")
+    tasks = sandbox._async_tasks()
+
+    await sandbox.aclose()
+
+    assert len(tasks) > 0
+    assert all(task.done() for task in tasks)
 
 
 @pytest.mark.asyncio
@@ -656,7 +954,7 @@ async def test_sandbox_python_subprocess_can_spawn_virtual_executable() -> None:
             (
                 "import subprocess, sys\n"
                 "process = subprocess.run(['python-tool', 'child'], capture_output=True)\n"
-                "print(process.returncode)\n"
+                "print(process.returncode, flush=True)\n"
                 "sys.stdout.buffer.write(process.stdout)\n"
                 "sys.stderr.buffer.write(process.stderr)\n"
             ),
@@ -748,6 +1046,7 @@ async def test_closing_virtual_executables_completes_active_request() -> None:
 
     assert result.returncode == 126
     assert result.stderr_text == "virtual executable request cancelled\n"
+    assert len(sandbox._virtual_executable_request_tasks) == 0
 
 
 @pytest.mark.asyncio
